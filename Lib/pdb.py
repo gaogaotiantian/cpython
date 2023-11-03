@@ -71,11 +71,14 @@ import os
 import io
 import re
 import sys
+import abc
 import cmd
-import bdb
+import bdbx as bdb
+#import bdb
 import dis
 import code
 import glob
+import runpy
 import codeop
 import pprint
 import signal
@@ -86,6 +89,7 @@ import traceback
 import linecache
 
 from contextlib import contextmanager
+from types import CodeType
 from typing import Union
 
 
@@ -123,86 +127,83 @@ class _rstr(str):
     def __repr__(self):
         return self
 
+class _ExecuteTarget(abc.ABC):
+    code: CodeType
 
-class _ScriptTarget(str):
-    def __new__(cls, val):
-        # Mutate self to be the "real path".
-        res = super().__new__(cls, os.path.realpath(val))
-
-        # Store the original path for error reporting.
-        res.orig = val
-
-        return res
-
-    def check(self):
-        if not os.path.exists(self):
-            print('Error:', self.orig, 'does not exist')
-            sys.exit(1)
-        if os.path.isdir(self):
-            print('Error:', self.orig, 'is a directory')
-            sys.exit(1)
-
-        # Replace pdb's dir with script's dir in front of module search path.
-        sys.path[0] = os.path.dirname(self)
+    @abc.abstractmethod
+    def __init__(self, filename: str):
+        pass
 
     @property
-    def filename(self):
-        return self
+    @abc.abstractmethod
+    def namespaces(self) -> tuple[dict, dict]:
+        pass
+
+    def __str__(self):
+        return self.filename
+
+
+class _ModuleTarget(_ExecuteTarget):
+    def __init__(self, filename):
+        # Just raise the normal exception if module is not found
+        _, self.spec, self.code = runpy._get_module_details(filename)
+        self.filename = os.path.normcase(os.path.abspath(self.code.co_filename))
 
     @property
-    def namespace(self):
-        return dict(
-            __name__='__main__',
-            __file__=self,
-            __builtins__=__builtins__,
-        )
+    def namespaces(self):
+        ns = {
+            '__name__': '__main__',
+            '__file__': self.filename,
+            '__package__': self.spec.parent,
+            '__loader__': self.spec.loader,
+            '__spec__': self.spec,
+            '__builtins___': __builtins__,
+        }
+        return ns, ns
+
+
+class _ScriptTarget(_ExecuteTarget):
+    def __init__(self, filename):
+        self.filename = os.path.realpath(filename)
+        if not os.path.exists(filename):
+            raise FileNotFoundError(filename)
+        if os.path.isdir(self.filename):
+            print('Error:', self.filename, 'is a directory')
+            sys.exit(1)
+        sys.path[0] = os.path.dirname(self.filename)
+
+    @property
+    def namespaces(self):
+        ns = {
+            '__name__': '__main__',
+            '__file__': self.filename,
+            '__builtins__': __builtins__,
+        }
+        return ns, ns
 
     @property
     def code(self):
-        with io.open_code(self) as fp:
-            return f"exec(compile({fp.read()!r}, {self!r}, 'exec'))"
+        with io.open_code(self.filename) as f:
+            return compile(f.read(), self.filename, "exec")
 
 
-class _ModuleTarget(str):
-    def check(self):
-        try:
-            self._details
-        except ImportError as e:
-            print(f"ImportError: {e}")
-            sys.exit(1)
-        except Exception:
-            traceback.print_exc()
-            sys.exit(1)
-
-    @functools.cached_property
-    def _details(self):
-        import runpy
-        return runpy._get_module_details(self)
+class _ModuleTarget(_ExecuteTarget):
+    def __init__(self, filename):
+        # Just raise the normal exception if module is not found
+        _, self.spec, self.code = runpy._get_module_details(filename)
+        self.filename = os.path.normcase(os.path.abspath(self.code.co_filename))
 
     @property
-    def filename(self):
-        return self.code.co_filename
-
-    @property
-    def code(self):
-        name, spec, code = self._details
-        return code
-
-    @property
-    def _spec(self):
-        name, spec, code = self._details
-        return spec
-
-    @property
-    def namespace(self):
-        return dict(
-            __name__='__main__',
-            __file__=os.path.normcase(os.path.abspath(self.filename)),
-            __package__=self._spec.parent,
-            __loader__=self._spec.loader,
-            __spec__=self._spec,
-            __builtins__=__builtins__,
-        )
+    def namespaces(self):
+        ns = {
+            '__name__': '__main__',
+            '__file__': self.filename,
+            '__package__': self.spec.parent,
+            '__loader__': self.spec.loader,
+            '__spec__': self.spec,
+            '__builtins___': __builtins__,
+        }
+        return ns, ns
 
 
 # Interaction prompt line will separate file and call info from code
@@ -346,9 +347,8 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         that we ever need to stop in this function."""
         if self._wait_for_mainpyfile:
             return
-        if self.stop_here(frame):
-            self.message('--Call--')
-            self.interaction(frame, None)
+        self.message('--Call--')
+        self.interaction(frame, None)
 
     def user_line(self, frame):
         """This function is called when we stop or break at this line."""
@@ -855,6 +855,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         # parse stuff before comma: [filename:]lineno | function
         colon = arg.rfind(':')
         funcname = None
+        code = None
         if colon >= 0:
             filename = arg[:colon].rstrip()
             f = self.lookupmodule(filename)
@@ -904,7 +905,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         line = self.checkline(filename, lineno)
         if line:
             # now set the break point
-            err = self.set_break(filename, line, temporary, cond, funcname)
+            err = self.set_break(filename, line, temporary, cond, funcname, code)
             if err:
                 self.error(err)
             else:
@@ -1430,7 +1431,6 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         argument (which is an arbitrary expression or statement to be
         executed in the current environment).
         """
-        sys.settrace(None)
         globals = self.curframe.f_globals
         locals = self.curframe_locals
         p = Pdb(self.completekey, self.stdin, self.stdout)
@@ -1441,7 +1441,6 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         except Exception:
             self._error_exc()
         self.message("LEAVING RECURSIVE DEBUGGER")
-        sys.settrace(self.trace_dispatch)
         self.lastcmd = p.lastcmd
 
     complete_debug = _complete_expression
@@ -1934,10 +1933,14 @@ class Pdb(bdb.Bdb, cmd.Cmd):
         # __main__ will break). Clear __main__ and replace with
         # the target namespace.
         import __main__
+        main_dict = __main__.__dict__.copy()
+        globals, locals = target.namespaces
         __main__.__dict__.clear()
-        __main__.__dict__.update(target.namespace)
+        __main__.__dict__.update(globals)
 
-        self.run(target.code)
+        self.run(target.code, globals=globals, locals=locals)
+        __main__.__dict__.clear()
+        __main__.__dict__.update(main_dict)
 
     def _format_exc(self, exc: BaseException):
         return traceback.format_exception_only(exc)[-1].strip()
@@ -2161,8 +2164,6 @@ def main():
         file = opts.pyfile
         target = _ScriptTarget(file)
 
-    target.check()
-
     sys.argv[:] = [file] + opts.args  # Hide "pdb.py" and pdb options from argument list
 
     # Note on saving/restoring sys.argv: it's a good idea when sys.argv was
@@ -2175,7 +2176,7 @@ def main():
         try:
             pdb._run(target)
         except Restart:
-            print("Restarting", target, "with arguments:")
+            print(f"Restarting {target} with arguments:")
             print("\t" + " ".join(sys.argv[1:]))
         except SystemExit as e:
             # In most cases SystemExit does not warrant a post-mortem session.
@@ -2186,8 +2187,7 @@ def main():
             print("Uncaught exception. Entering post mortem debugging")
             print("Running 'cont' or 'step' will restart the program")
             pdb.interaction(None, e)
-            print("Post mortem debugger finished. The " + target +
-                  " will be restarted")
+            print(f"Post mortem debugger finished. The {target} will be restarted")
         if pdb._user_requested_quit:
             break
         print("The program finished and will be restarted")
