@@ -515,6 +515,10 @@ class Pdb(bdb.Bdb, cmd.Cmd):
                          "running stale code until the program is rerun")
         self._file_mtime_table[filename] = mtime
 
+    def emptyline(self):
+        if self.lastcmd and self.lastcmd != "w 0":
+            return self.onecmd(self.lastcmd)
+
     # Called before loop, handles display expressions
     # Set up convenience variable containers
     def preloop(self):
@@ -607,10 +611,7 @@ class Pdb(bdb.Bdb, cmd.Cmd):
             # is expected, and we should print it right before the user input.
             # If self.cmdqueue is not empty, we append a "w 0" command to the
             # queue, which is equivalent to print_stack_entry
-            if self.cmdqueue:
-                self.cmdqueue.append('w 0')
-            else:
-                self.print_stack_entry(self.stack[self.curindex])
+            self.cmdqueue.append('w 0')
             self._cmdloop()
             # If "w 0" is not used, pop it out
             if self.cmdqueue and self.cmdqueue[-1] == 'w 0':

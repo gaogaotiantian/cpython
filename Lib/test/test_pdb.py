@@ -678,9 +678,9 @@ def test_pdb_display_command():
     (Pdb) display a
     display a: 0
     (Pdb) n
+    display a: 1  [old: 0]
     > <doctest test.test_pdb.test_pdb_display_command[0]>(5)test_function()
     -> a = 2
-    display a: 1  [old: 0]
     (Pdb) display
     Currently displaying:
     a: 1
